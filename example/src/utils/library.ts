@@ -1,5 +1,17 @@
 export type BookFormat = 'txt' | 'md' | 'html' | 'epub' | 'pdf' | 'mobi';
 
+export type BookMarkStyle = 'highlight' | 'underline' | 'wavy';
+
+export interface BookMark {
+  id: string;
+  text: string;
+  color: string;
+  style: BookMarkStyle;
+  start?: number;
+  end?: number;
+  cfiRange?: string;
+}
+
 export interface Book {
   id: string;
   title: string;
@@ -14,6 +26,7 @@ export interface Book {
   page?: number;
   chapter?: string;
   readerMode?: 'text' | 'epub' | 'pdf';
+  marks?: BookMark[];
 }
 
 export type BookPosition = Pick<Book, 'progress' | 'updatedAt'> &

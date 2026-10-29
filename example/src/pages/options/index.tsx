@@ -2,6 +2,7 @@ import type { PDFDocumentProxy } from 'pdfjs-dist';
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,6 +10,8 @@ import React, {
 import {
   addBook,
   Book,
+  BookMark,
+  BookMarkStyle,
   BookPosition,
   listBooks,
   removeBook,
@@ -27,6 +30,193 @@ import {
 } from './Readers';
 
 type SidebarTab = 'toc' | 'thumbnails';
+interface ReaderPreferences {
+  fontSize: number;
+  theme: ReaderTheme;
+  layout: ReaderLayout;
+  sidebarTab: SidebarTab;
+  sidebarOpen: boolean;
+  showProgress: boolean;
+  allowPdfBackground: boolean;
+  readerWidth: number;
+  markColor: string;
+  markStyle: BookMarkStyle;
+}
+
+const READER_PREFERENCES_KEY = 'paperbound-reader-preferences';
+
+function isReaderPreferences(
+  value: unknown,
+): value is Partial<ReaderPreferences> {
+  return typeof value === 'object' && value !== null;
+}
+
+function parseReaderPreferences(value: unknown): Partial<ReaderPreferences> {
+  if (!isReaderPreferences(value)) {
+    throw new Error('阅读设置数据格式无效');
+  }
+  const preferences: Partial<ReaderPreferences> = {};
+  const themes: ReaderTheme[] = [
+    'light',
+    'blue',
+    'sepia',
+    'green',
+    'rose',
+    'dark',
+  ];
+  if (typeof value.fontSize === 'number' && Number.isFinite(value.fontSize)) {
+    preferences.fontSize = Math.min(36, Math.max(12, value.fontSize));
+  }
+  if (themes.includes(value.theme as ReaderTheme)) {
+    preferences.theme = value.theme as ReaderTheme;
+  }
+  if (value.layout === 'scroll' || value.layout === 'single') {
+    preferences.layout = value.layout;
+  }
+  if (value.sidebarTab === 'toc' || value.sidebarTab === 'thumbnails') {
+    preferences.sidebarTab = value.sidebarTab;
+  }
+  if (typeof value.sidebarOpen === 'boolean') {
+    preferences.sidebarOpen = value.sidebarOpen;
+  }
+  if (typeof value.showProgress === 'boolean') {
+    preferences.showProgress = value.showProgress;
+  }
+  if (typeof value.allowPdfBackground === 'boolean') {
+    preferences.allowPdfBackground = value.allowPdfBackground;
+  }
+  if (
+    typeof value.readerWidth === 'number' &&
+    Number.isFinite(value.readerWidth)
+  ) {
+    preferences.readerWidth = Math.min(1400, Math.max(560, value.readerWidth));
+  }
+  if (
+    typeof value.markColor === 'string' &&
+    /^#[\da-f]{6}$/i.test(value.markColor)
+  ) {
+    preferences.markColor = value.markColor;
+  }
+  if (
+    value.markStyle === 'highlight' ||
+    value.markStyle === 'underline' ||
+    value.markStyle === 'wavy'
+  ) {
+    preferences.markStyle = value.markStyle;
+  }
+  return preferences;
+}
+
+interface PendingMark {
+  text: string;
+  start?: number;
+  end?: number;
+  cfiRange?: string;
+}
+
+type PositionedBookMark = BookMark & { start: number; end: number };
+
+const markColors = [
+  '#f2d94e',
+  '#ef476f',
+  '#ff9f1c',
+  '#35b6c8',
+  '#8e4a8f',
+  '#ef8354',
+];
+
+function applyTextMarks(root: HTMLElement, marks: BookMark[]): void {
+  root
+    .querySelectorAll<HTMLElement>('[data-reader-mark]')
+    .forEach((wrapper) => {
+      wrapper.replaceWith(...Array.from(wrapper.childNodes));
+    });
+  root.normalize();
+
+  const textNodes: Text[] = [];
+  const walker = root.ownerDocument.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT,
+  );
+  let node: Node | null;
+  while ((node = walker.nextNode())) {
+    if (node.textContent) textNodes.push(node as Text);
+  }
+
+  let documentOffset = 0;
+  textNodes.forEach((textNode) => {
+    const textLength = textNode.data.length;
+    const nodeStart = documentOffset;
+    const nodeEnd = nodeStart + textLength;
+    documentOffset = nodeEnd;
+    const overlappingMarks = marks.filter(
+      (mark): mark is PositionedBookMark =>
+        typeof mark.start === 'number' &&
+        typeof mark.end === 'number' &&
+        mark.start < nodeEnd &&
+        mark.end > nodeStart,
+    );
+    if (!overlappingMarks.length) return;
+
+    const boundaries = new Set<number>([0, textLength]);
+    overlappingMarks.forEach((mark) => {
+      boundaries.add(Math.max(0, mark.start - nodeStart));
+      boundaries.add(Math.min(textLength, mark.end - nodeStart));
+    });
+    const sortedBoundaries = Array.from(boundaries).sort((a, b) => a - b);
+    const segments: { node: Text; start: number; end: number }[] = [];
+    let remaining = textNode;
+    let previousBoundary = 0;
+    sortedBoundaries.slice(1, -1).forEach((boundary) => {
+      const next = remaining.splitText(boundary - previousBoundary);
+      segments.push({
+        node: remaining,
+        start: previousBoundary,
+        end: boundary,
+      });
+      remaining = next;
+      previousBoundary = boundary;
+    });
+    segments.push({
+      node: remaining,
+      start: previousBoundary,
+      end: textLength,
+    });
+
+    segments.forEach((segment) => {
+      const segmentStart = nodeStart + segment.start;
+      const segmentEnd = nodeStart + segment.end;
+      const segmentMarks = overlappingMarks.filter(
+        (mark) => mark.start < segmentEnd && mark.end > segmentStart,
+      );
+      if (!segmentMarks.length || !segment.node.parentNode) return;
+
+      const wrapper = root.ownerDocument.createElement('span');
+      wrapper.dataset.readerMark = 'true';
+      wrapper.title = segmentMarks.map((mark) => mark.text).join(' · ');
+      const highlight = segmentMarks
+        .filter((mark) => mark.style === 'highlight')
+        .pop();
+      const underline = segmentMarks
+        .filter((mark) => mark.style !== 'highlight')
+        .pop();
+      if (highlight) {
+        wrapper.style.backgroundColor = `color-mix(in srgb, ${highlight.color} 48%, transparent)`;
+        wrapper.style.borderRadius = '2px';
+      }
+      if (underline) {
+        wrapper.style.textDecorationLine = 'underline';
+        wrapper.style.textDecorationColor = underline.color;
+        wrapper.style.textDecorationThickness = '2px';
+        wrapper.style.textDecorationStyle =
+          underline.style === 'wavy' ? 'wavy' : 'solid';
+      }
+      segment.node.parentNode.replaceChild(wrapper, segment.node);
+      wrapper.appendChild(segment.node);
+    });
+  });
+}
+
 function getFormat(fileName: string): Book['format'] | undefined {
   const extension = fileName.split('.').pop()?.toLowerCase();
   if (extension === 'txt') return 'txt';
@@ -174,17 +364,112 @@ export default function OptionsPage() {
   const [navigationItems, setNavigationItems] = useState<ReaderNavItem[]>([]);
   const [navigationTarget, setNavigationTarget] = useState('');
   const [selectedChapter, setSelectedChapter] = useState('');
+  const [epubPageTotal, setEpubPageTotal] = useState(0);
   const [jumpToPage, setJumpToPage] = useState(1);
   const [pageCount, setPageCount] = useState(0);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
+  const [pendingMark, setPendingMark] = useState<PendingMark>();
+  const [markColor, setMarkColor] = useState(markColors[0]);
+  const [markStyle, setMarkStyle] = useState<BookMarkStyle>('highlight');
   const [navSearch, setNavSearch] = useState('');
   const [isLoading, setLoading] = useState(true);
   const [isImporting, setImporting] = useState(false);
   const [error, setError] = useState('');
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false);
+  const [canSavePreferences, setCanSavePreferences] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const mobiEpubInput = useRef<HTMLInputElement>(null);
   const readerScroll = useRef<HTMLDivElement>(null);
+  const textReaderRef = useRef<HTMLElement>(null);
   const saveTimer = useRef<number>();
+
+  useLayoutEffect(() => {
+    const article = textReaderRef.current;
+    if (!article) return;
+    applyTextMarks(
+      article,
+      activeBook?.format === 'epub' ? [] : activeBook?.marks ?? [],
+    );
+  }, [activeBook?.id, activeBook?.content, activeBook?.marks]);
+
+  useEffect(() => {
+    try {
+      const savedPreferences = window.localStorage.getItem(
+        READER_PREFERENCES_KEY,
+      );
+      if (savedPreferences) {
+        const preferences = parseReaderPreferences(
+          JSON.parse(savedPreferences) as unknown,
+        );
+        if (preferences.fontSize !== undefined)
+          setFontSize(preferences.fontSize);
+        if (preferences.theme) setTheme(preferences.theme);
+        if (preferences.layout) setLayout(preferences.layout);
+        if (preferences.sidebarTab) setSidebarTab(preferences.sidebarTab);
+        if (preferences.sidebarOpen !== undefined)
+          setSidebarOpen(preferences.sidebarOpen);
+        if (preferences.showProgress !== undefined)
+          setShowProgress(preferences.showProgress);
+        if (preferences.allowPdfBackground !== undefined)
+          setAllowPdfBackground(preferences.allowPdfBackground);
+        if (preferences.readerWidth !== undefined)
+          setReaderWidth(preferences.readerWidth);
+        if (preferences.markColor) setMarkColor(preferences.markColor);
+        if (preferences.markStyle) setMarkStyle(preferences.markStyle);
+      }
+      setCanSavePreferences(true);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? `读取阅读设置失败：${cause.message}`
+          : '读取阅读设置失败',
+      );
+    } finally {
+      setPreferencesLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!preferencesLoaded || !canSavePreferences) return;
+    const preferences: ReaderPreferences = {
+      fontSize,
+      theme,
+      layout,
+      sidebarTab,
+      sidebarOpen,
+      showProgress,
+      allowPdfBackground,
+      readerWidth,
+      markColor,
+      markStyle,
+    };
+    try {
+      window.localStorage.setItem(
+        READER_PREFERENCES_KEY,
+        JSON.stringify(preferences),
+      );
+    } catch (cause) {
+      setCanSavePreferences(false);
+      setError(
+        cause instanceof Error
+          ? `保存阅读设置失败：${cause.message}`
+          : '保存阅读设置失败',
+      );
+    }
+  }, [
+    allowPdfBackground,
+    canSavePreferences,
+    fontSize,
+    layout,
+    markColor,
+    markStyle,
+    preferencesLoaded,
+    readerWidth,
+    showProgress,
+    sidebarOpen,
+    sidebarTab,
+    theme,
+  ]);
 
   useEffect(() => {
     listBooks()
@@ -221,10 +506,10 @@ export default function OptionsPage() {
     setNavigationItems([]);
     setNavigationTarget('');
     setSelectedChapter('');
+    setPendingMark(undefined);
     setJumpToPage(activeBook?.page ?? 1);
     setPageCount(0);
     setNavSearch('');
-    setSidebarTab('toc');
     setZoom(1);
     setAutoZoom(true);
     setRotation(0);
@@ -264,9 +549,87 @@ export default function OptionsPage() {
     setNavigationItems(items);
   }, []);
 
-  const handleChapterChange = useCallback((target: string) => {
-    setSelectedChapter(target);
-  }, []);
+  const handleEpubTextSelection = useCallback(
+    (cfiRange: string, selectedText: string) => {
+      const text = selectedText.trim();
+      if (text) setPendingMark({ text, cfiRange });
+    },
+    [],
+  );
+
+  const captureTextSelection = () => {
+    const article = textReaderRef.current;
+    const selection = window.getSelection();
+    if (
+      !article ||
+      !selection ||
+      selection.isCollapsed ||
+      !selection.rangeCount
+    ) {
+      setPendingMark(undefined);
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    if (
+      !article.contains(range.startContainer) ||
+      !article.contains(range.endContainer)
+    ) {
+      setPendingMark(undefined);
+      return;
+    }
+    const selectedText = range.toString();
+    const text = selectedText.trim();
+    if (!text) {
+      setPendingMark(undefined);
+      return;
+    }
+
+    const leadingWhitespace =
+      selectedText.length - selectedText.trimStart().length;
+    const prefix = article.ownerDocument.createRange();
+    prefix.selectNodeContents(article);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length + leadingWhitespace;
+    setPendingMark({ text, start, end: start + text.length });
+  };
+
+  const savePendingMark = async () => {
+    if (!activeBook || !pendingMark) return;
+    const mark: BookMark = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      text: pendingMark.text,
+      color: markColor,
+      style: markStyle,
+      ...(pendingMark.start !== undefined ? { start: pendingMark.start } : {}),
+      ...(pendingMark.end !== undefined ? { end: pendingMark.end } : {}),
+      ...(pendingMark.cfiRange ? { cfiRange: pendingMark.cfiRange } : {}),
+    };
+    const updatedBook: Book = {
+      ...activeBook,
+      marks: [...(activeBook.marks ?? []), mark],
+      updatedAt: Date.now(),
+    };
+    try {
+      await updateBook(updatedBook);
+      setBooks((current) =>
+        current.map((book) =>
+          book.id === updatedBook.id ? updatedBook : book,
+        ),
+      );
+      setActiveBook(updatedBook);
+      setPendingMark(undefined);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '保存标记失败');
+    }
+  };
+
+  const handleChapterChange = useCallback(
+    (target: string, totalPages: number) => {
+      setSelectedChapter(target);
+      setEpubPageTotal(totalPages);
+    },
+    [],
+  );
 
   const handlePdfPageCount = useCallback((count: number) => {
     setPageCount(count);
@@ -546,6 +909,7 @@ export default function OptionsPage() {
           onPosition={handleActivePosition}
           onToc={handleReaderToc}
           onCurrentChapter={handleChapterChange}
+          onTextSelection={handleEpubTextSelection}
           onError={setError}
         />
       );
@@ -573,6 +937,7 @@ export default function OptionsPage() {
     return (
       <article
         className={styles.readerText}
+        ref={textReaderRef}
         style={{
           fontSize: `${fontSize}px`,
           maxWidth: `${readerWidth}px`,
@@ -596,6 +961,7 @@ export default function OptionsPage() {
     setActiveBook(undefined);
     setPdfDocument(undefined);
     setPageCount(0);
+    setEpubPageTotal(0);
   };
 
   const deleteActiveBook = async () => {
@@ -610,6 +976,7 @@ export default function OptionsPage() {
       setActiveBook(undefined);
       setPdfDocument(undefined);
       setPageCount(0);
+      setEpubPageTotal(0);
       setError('');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '移除图书失败');
@@ -620,6 +987,7 @@ export default function OptionsPage() {
     setError('');
     setPdfDocument(undefined);
     setPageCount(0);
+    setEpubPageTotal(0);
     setActiveBook(book);
     setReaderOpen(true);
   };
@@ -966,7 +1334,43 @@ export default function OptionsPage() {
                             {item.label.slice(0, 2)}
                           </span>
                         )}
-                        <span>{item.label}</span>
+                        <span className={styles.navItemLabel}>
+                          {item.label}
+                        </span>
+                        {sidebarTab === 'toc' &&
+                          (item.page !== undefined ||
+                            (item.pageProgress !== undefined &&
+                              epubPageTotal > 0)) && (
+                            <span
+                              className={styles.navPage}
+                              aria-label={
+                                item.page !== undefined
+                                  ? `第 ${item.page} 页`
+                                  : `约第 ${Math.max(
+                                      1,
+                                      Math.round(
+                                        (item.pageProgress ?? 0) *
+                                          (epubPageTotal - 1),
+                                      ) + 1,
+                                    )} 页`
+                              }
+                              title={
+                                item.page !== undefined
+                                  ? `第 ${item.page} 页`
+                                  : '根据章节位置估算'
+                              }
+                            >
+                              {item.page !== undefined
+                                ? item.page
+                                : `~${Math.max(
+                                    1,
+                                    Math.round(
+                                      (item.pageProgress ?? 0) *
+                                        (epubPageTotal - 1),
+                                    ) + 1,
+                                  )}`}
+                            </span>
+                          )}
                       </button>
                     ))
                   ) : (
@@ -991,9 +1395,100 @@ export default function OptionsPage() {
               }`}
               ref={readerScroll}
               onScroll={onReaderScroll}
+              onMouseUp={captureTextSelection}
+              onTouchEnd={captureTextSelection}
             >
               {renderReaderBody()}
             </div>
+            {pendingMark &&
+              activeBook.format !== 'pdf' &&
+              activeBook.format !== 'mobi' && (
+                <div
+                  className={styles.markToolbar}
+                  role="toolbar"
+                  aria-label="文字标记"
+                  onTouchStart={(event) => event.stopPropagation()}
+                >
+                  <div className={styles.markPalette}>
+                    {markColors.map((color) => (
+                      <button
+                        key={color}
+                        className={`${styles.markColor} ${
+                          markColor === color ? styles.activeMarkColor : ''
+                        }`}
+                        type="button"
+                        aria-label={`选择颜色 ${color}`}
+                        title={color}
+                        style={{ backgroundColor: color }}
+                        onClick={() => setMarkColor(color)}
+                      />
+                    ))}
+                    <label
+                      className={`${styles.customMarkColor} ${
+                        !markColors.includes(markColor)
+                          ? styles.activeCustomMarkColor
+                          : ''
+                      }`}
+                      title="自定义颜色"
+                    >
+                      <span aria-hidden="true">+</span>
+                      <input
+                        type="color"
+                        aria-label="自定义标记颜色"
+                        value={markColor}
+                        onChange={(event) => setMarkColor(event.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div className={styles.markActions}>
+                    <button
+                      className={
+                        markStyle === 'highlight' ? styles.activeMarkStyle : ''
+                      }
+                      type="button"
+                      aria-pressed={markStyle === 'highlight'}
+                      onClick={() => setMarkStyle('highlight')}
+                    >
+                      底色
+                    </button>
+                    <button
+                      className={
+                        markStyle === 'underline' ? styles.activeMarkStyle : ''
+                      }
+                      type="button"
+                      aria-pressed={markStyle === 'underline'}
+                      onClick={() => setMarkStyle('underline')}
+                    >
+                      直线
+                    </button>
+                    <button
+                      className={
+                        markStyle === 'wavy' ? styles.activeMarkStyle : ''
+                      }
+                      type="button"
+                      aria-pressed={markStyle === 'wavy'}
+                      onClick={() => setMarkStyle('wavy')}
+                    >
+                      波浪
+                    </button>
+                    <button
+                      className={styles.saveMarkButton}
+                      type="button"
+                      onClick={() => void savePendingMark()}
+                    >
+                      标记
+                    </button>
+                    <button
+                      className={styles.dismissMarkButton}
+                      type="button"
+                      aria-label="取消标记"
+                      onClick={() => setPendingMark(undefined)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+              )}
             {settingsOpen && (
               <aside className={styles.settingsPanel}>
                 <header className={styles.settingsHeader}>

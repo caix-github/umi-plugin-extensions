@@ -1,5 +1,6 @@
 import type {
   Book as EpubBook,
+  Contents,
   Location as EpubLocation,
   NavItem,
   Rendition,
@@ -8,7 +9,7 @@ import ePub from 'epubjs';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Book, BookPosition } from '../../utils/library';
+import { Book, BookMark, BookPosition } from '../../utils/library';
 import styles from './index.css';
 
 export type ReaderTheme =
@@ -23,6 +24,17 @@ export type ReaderLayout = 'scroll' | 'single';
 export interface ReaderNavItem {
   label: string;
   target: string;
+  page?: number;
+  pageProgress?: number;
+}
+
+interface ReaderHighlightEnvironment {
+  CSS: typeof CSS & {
+    highlights?: {
+      set: (name: string, highlight: object) => void;
+    };
+  };
+  Highlight?: new (range: Range) => object;
 }
 
 interface ReaderProps {
@@ -34,7 +46,8 @@ interface ReaderProps {
   contentWidth?: number;
   onPosition: (position: BookPosition) => void;
   onToc?: (items: ReaderNavItem[]) => void;
-  onCurrentChapter?: (target: string) => void;
+  onCurrentChapter?: (target: string, totalPages: number) => void;
+  onTextSelection?: (cfiRange: string, text: string) => void;
   onError: (message: string) => void;
 }
 
@@ -65,6 +78,57 @@ function epubTheme(theme: ReaderTheme): { color: string; background: string } {
   return { color: '#242a25', background: '#fffefa' };
 }
 
+function customHighlightsAvailable(): boolean {
+  const highlightEnvironment = window as Window &
+    Partial<ReaderHighlightEnvironment>;
+  return Boolean(
+    highlightEnvironment.CSS?.highlights && highlightEnvironment.Highlight,
+  );
+}
+
+function applyEpubMarks(
+  epubBook: EpubBook,
+  rendition: Rendition,
+  marks: BookMark[],
+): void {
+  rendition.getContents().forEach((contents) => {
+    const highlightEnvironment = contents.window as Window &
+      Partial<ReaderHighlightEnvironment>;
+    const registry = highlightEnvironment.CSS?.highlights;
+    const Highlight = highlightEnvironment.Highlight;
+    if (!registry || !Highlight) return;
+
+    let styleElement = contents.document.getElementById(
+      'paperbound-reader-marks',
+    ) as HTMLStyleElement | null;
+    if (!styleElement) {
+      styleElement = contents.document.createElement('style');
+      styleElement.id = 'paperbound-reader-marks';
+      contents.document.head.appendChild(styleElement);
+    }
+
+    const rules: string[] = [];
+    marks.forEach((mark) => {
+      if (!mark.cfiRange) return;
+      const section = epubBook.spine.get(mark.cfiRange);
+      if (!section || section.index !== contents.sectionIndex) return;
+      const name = `paperbound-mark-${mark.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+      const range = contents.range(mark.cfiRange);
+      registry.set(name, new Highlight(range));
+      rules.push(
+        mark.style === 'highlight'
+          ? `::highlight(${name}) { background-color: color-mix(in srgb, ${mark.color} 48%, transparent); }`
+          : `::highlight(${name}) { text-decoration-line: underline; text-decoration-style: ${
+              mark.style === 'wavy' ? 'wavy' : 'solid'
+            }; text-decoration-color: ${
+              mark.color
+            }; text-decoration-thickness: 2px; }`,
+      );
+    });
+    styleElement.textContent = rules.join('\n');
+  });
+}
+
 export function pdfPageBackground(theme: ReaderTheme): string {
   return {
     light: '#fffefa',
@@ -83,6 +147,7 @@ export function EpubReader({
   layout,
   navigationTarget,
   contentWidth,
+  onTextSelection,
   onPosition,
   onToc,
   onCurrentChapter,
@@ -91,8 +156,11 @@ export function EpubReader({
   const containerRef = useRef<HTMLDivElement>(null);
   const renditionRef = useRef<Rendition>();
   const epubBookRef = useRef<EpubBook>();
+  const appliedMarksRef = useRef<BookMark[]>([]);
+  const marksRef = useRef(book.marks ?? []);
   const [isLoading, setLoading] = useState(true);
   const [currentLocation, setCurrentLocation] = useState('');
+  marksRef.current = book.marks ?? [];
 
   useEffect(() => {
     let isMounted = true;
@@ -114,6 +182,16 @@ export function EpubReader({
     });
     renditionRef.current = rendition;
 
+    const handleSelected = (cfiRange: string, contents: Contents) => {
+      const selectedRange = contents.range(cfiRange);
+      onTextSelection?.(cfiRange, selectedRange.toString());
+    };
+    const handleRendered = () => {
+      if (customHighlightsAvailable()) {
+        applyEpubMarks(epubBook, rendition, marksRef.current);
+      }
+    };
+
     const handleRelocated = (location: EpubLocation) => {
       const cfi = location.start.cfi;
       const calculatedProgress = epubBook.locations.percentageFromCfi(cfi);
@@ -122,7 +200,7 @@ export function EpubReader({
         ? calculatedProgress
         : fallbackProgress;
       const progress = Math.max(0, Math.min(100, Math.round(percentage * 100)));
-      onCurrentChapter?.(location.start.href);
+      onCurrentChapter?.(location.start.href, location.start.displayed.total);
       setCurrentLocation(
         `${location.start.displayed.page} / ${location.start.displayed.total}`,
       );
@@ -130,19 +208,31 @@ export function EpubReader({
     };
 
     rendition.on('relocated', handleRelocated);
+    rendition.on('selected', handleSelected);
+    rendition.on('rendered', handleRendered);
     void (async () => {
       try {
         await epubBook.ready;
         const navigation = await epubBook.loaded.navigation;
         const navigationItems = flattenToc(navigation.toc);
-        onToc?.(
-          navigationItems.map((item) => ({
-            label: item.label,
-            target: item.href,
-          })),
-        );
         await epubBook.locations.generate(1000);
+        onToc?.(
+          navigationItems.map((item) => {
+            const section = epubBook.spine.get(item.href);
+            const pageProgress = section
+              ? epubBook.locations.percentageFromCfi(section.cfiBase)
+              : undefined;
+            return {
+              label: item.label,
+              target: item.href,
+              ...(pageProgress !== undefined && Number.isFinite(pageProgress)
+                ? { pageProgress }
+                : {}),
+            };
+          }),
+        );
         await rendition.display(book.chapter || undefined);
+        handleRendered();
         if (isMounted) setLoading(false);
       } catch (cause) {
         if (isMounted) {
@@ -159,10 +249,13 @@ export function EpubReader({
     return () => {
       isMounted = false;
       rendition.off('relocated', handleRelocated);
+      rendition.off('selected', handleSelected);
+      rendition.off('rendered', handleRendered);
       rendition.destroy();
       epubBook.destroy();
       renditionRef.current = undefined;
       epubBookRef.current = undefined;
+      appliedMarksRef.current = [];
     };
   }, [
     book.id,
@@ -170,6 +263,7 @@ export function EpubReader({
     layout,
     onCurrentChapter,
     onError,
+    onTextSelection,
     onPosition,
     onToc,
   ]);
@@ -177,13 +271,74 @@ export function EpubReader({
   useEffect(() => {
     const rendition = renditionRef.current;
     if (!rendition) return;
+    appliedMarksRef.current.forEach((mark) => {
+      if (!mark.cfiRange) return;
+      rendition.annotations.remove(
+        mark.cfiRange,
+        mark.style === 'highlight' ? 'highlight' : 'underline',
+      );
+    });
+    const marks = book.marks?.filter((mark) => mark.cfiRange) ?? [];
+    if (customHighlightsAvailable()) {
+      const epubBook = epubBookRef.current;
+      if (epubBook) applyEpubMarks(epubBook, rendition, marks);
+      appliedMarksRef.current = [];
+    } else {
+      marks.forEach((mark) => {
+        if (!mark.cfiRange) return;
+        const isHighlight = mark.style === 'highlight';
+        rendition.annotations.add(
+          isHighlight ? 'highlight' : 'underline',
+          mark.cfiRange,
+          { id: mark.id },
+          undefined,
+          `reader-mark-${mark.style}`,
+          isHighlight
+            ? { fill: mark.color, 'fill-opacity': '0.42' }
+            : {
+                stroke: mark.color,
+                'stroke-opacity': '0.9',
+                'stroke-width': '2',
+              },
+        );
+      });
+      appliedMarksRef.current = marks;
+    }
+  }, [book.marks, layout]);
+
+  useEffect(() => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
     const colors = epubTheme(theme);
     rendition.themes.default({
+      'html, body': {
+        color: `${colors.color} !important`,
+        background: `${colors.background} !important`,
+        'background-image': 'none !important',
+      },
       body: {
-        color: colors.color,
-        background: colors.background,
-        'font-size': `${fontSize}px`,
-        'line-height': '1.8',
+        'font-family':
+          '"Noto Serif SC", "Songti SC", "SimSun", serif !important',
+        'font-size': `${fontSize}px !important`,
+        'line-height': '1.9 !important',
+        'text-align': 'justify',
+      },
+      'body *': {
+        color: `${colors.color} !important`,
+      },
+      'p, li, blockquote': {
+        'font-size': `${fontSize}px !important`,
+        'line-height': '1.9 !important',
+      },
+      p: {
+        margin: '0 0 1em !important',
+        'text-indent': '2em !important',
+      },
+      'h1, h2, h3, h4, h5, h6': {
+        'font-family':
+          '"Noto Serif SC", "Songti SC", "SimSun", serif !important',
+        'line-height': '1.5 !important',
+        'text-indent': '0 !important',
       },
     });
   }, [fontSize, theme]);
@@ -262,6 +417,7 @@ async function getPdfNavigation(
         navigationItems.push({
           label: item.title,
           target: String(pageIndex + 1),
+          page: pageIndex + 1,
         });
       }
       await append(item.items);

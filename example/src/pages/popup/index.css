@@ -1,19 +1,81 @@
-body,
-html,
-#root {
-  /*height: 100%;*/
+:global(html),
+:global(body),
+:global(#root) {
+  width: 320px;
+  min-height: 240px;
   margin: 0;
-  width: 200px;
-  height: 100px;
 }
 
-a {
-  color: #1890ff;
-  cursor: pointer;
+:global(body) {
+  background: #f7f5f0;
+  color: #242a25;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 
-.normal {
-  background: #ddd;
-  /*height: 100vh;*/
-  padding: 48px;
+.popup {
+  padding: 25px 24px 21px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brandMark {
+  width: 41px;
+  height: 41px;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  background: #e4eee3;
+  color: #456b51;
+  font-size: 21px;
+}
+
+.brand strong,
+.brand small {
+  display: block;
+}
+
+.brand strong {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 18px;
+}
+
+.brand small {
+  margin-top: 4px;
+  color: #898d83;
+  font-size: 11px;
+}
+
+.description {
+  margin: 21px 0 15px;
+  color: #62685f;
+  font-size: 13px;
+}
+
+.openButton {
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 9px;
+  background: #527b62;
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.openButton:hover {
+  background: #41674f;
+}
+
+.formats {
+  margin: 14px 0 0;
+  color: #898d83;
+  font-size: 10px;
+  text-align: center;
 }

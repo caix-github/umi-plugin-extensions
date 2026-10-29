@@ -1,14 +1,23 @@
+export type BookFormat = 'txt' | 'md' | 'html' | 'epub' | 'pdf' | 'mobi';
+
 export interface Book {
   id: string;
   title: string;
   fileName: string;
-  format: 'txt' | 'md' | 'html';
-  content: string;
+  format: BookFormat;
+  content?: string;
+  binaryData?: ArrayBuffer;
   addedAt: number;
   updatedAt: number;
   progress: number;
-  scrollTop: number;
+  scrollTop?: number;
+  page?: number;
+  chapter?: string;
+  readerMode?: 'text' | 'epub' | 'pdf';
 }
+
+export type BookPosition = Pick<Book, 'progress' | 'updatedAt'> &
+  Partial<Pick<Book, 'scrollTop' | 'page' | 'chapter'>>;
 
 const DATABASE_NAME = 'paperbound-library';
 const STORE_NAME = 'books';
@@ -71,6 +80,28 @@ export async function updateBook(book: Book): Promise<void> {
   const transaction = database.transaction(STORE_NAME, 'readwrite');
   transaction.objectStore(STORE_NAME).put(book);
   await transactionDone(transaction);
+}
+
+export async function updateBookPosition(
+  id: string,
+  position: BookPosition,
+): Promise<Book> {
+  const database = await openDatabase();
+  const transaction = database.transaction(STORE_NAME, 'readwrite');
+  const store = transaction.objectStore(STORE_NAME);
+  const request = store.get(id) as IDBRequest<Book | undefined>;
+  let updatedBook: Book | undefined;
+  request.onsuccess = () => {
+    if (!request.result) {
+      transaction.abort();
+      return;
+    }
+    updatedBook = { ...request.result, ...position };
+    store.put(updatedBook);
+  };
+  await transactionDone(transaction);
+  if (!updatedBook) throw new Error('书籍已从书架移除，无法保存阅读进度');
+  return updatedBook;
 }
 
 export async function removeBook(id: string): Promise<void> {

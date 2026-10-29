@@ -1,20 +1,40 @@
+import type { PDFDocumentProxy } from 'pdfjs-dist';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   addBook,
   Book,
+  BookPosition,
   listBooks,
   removeBook,
   updateBook,
-} from '@/utils/library';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+  updateBookPosition,
+} from '../../utils/library';
 import styles from './index.css';
+import {
+  EpubReader,
+  pdfPageBackground,
+  PdfPageThumbnail,
+  PdfReader,
+  ReaderLayout,
+  ReaderNavItem,
+  ReaderTheme,
+} from './Readers';
 
-type Theme = 'light' | 'sepia' | 'dark';
-
+type SidebarTab = 'toc' | 'thumbnails';
 function getFormat(fileName: string): Book['format'] | undefined {
   const extension = fileName.split('.').pop()?.toLowerCase();
   if (extension === 'txt') return 'txt';
   if (extension === 'md' || extension === 'markdown') return 'md';
   if (extension === 'html' || extension === 'htm') return 'html';
+  if (extension === 'epub') return 'epub';
+  if (extension === 'pdf') return 'pdf';
+  if (extension === 'mobi') return 'mobi';
   return undefined;
 }
 
@@ -57,10 +77,24 @@ function htmlToText(source: string): string {
 function renderBookContent(content: string): React.ReactNode[] {
   return content.split(/\n\s*\n/).map((block, index) => {
     const lines = block.split('\n');
-    const heading = lines.length === 1 && /^(#{1,3})\s+(.+)$/.exec(lines[0]);
+    const markdownHeading = /^(#{1,3})\s+(.+)$/.exec(lines[0]);
+    const chapterHeading =
+      /^(第[0-9一二三四五六七八九十百零两〇]+[章节回卷].*)$/.exec(
+        lines[0].trim(),
+      );
+    const heading = markdownHeading
+      ? { level: markdownHeading[1].length, text: markdownHeading[2] }
+      : chapterHeading
+      ? { level: 2, text: chapterHeading[1] }
+      : undefined;
     if (heading) {
-      const Heading = `h${heading[1].length}` as 'h1' | 'h2' | 'h3';
-      return <Heading key={index}>{heading[2]}</Heading>;
+      const Heading = `h${heading.level}` as 'h1' | 'h2' | 'h3';
+      return (
+        <React.Fragment key={index}>
+          <Heading id={`reading-section-${index}`}>{heading.text}</Heading>
+          {lines.length > 1 && <p>{lines.slice(1).join('\n')}</p>}
+        </React.Fragment>
+      );
     }
 
     if (lines.every((line) => /^\s*[-*+]\s+/.test(line))) {
@@ -96,6 +130,22 @@ function renderBookContent(content: string): React.ReactNode[] {
   });
 }
 
+function getTextNavigation(content: string): ReaderNavItem[] {
+  return content.split(/\n\s*\n/).flatMap((block, index) => {
+    const label = block.trim().split('\n', 1)[0];
+    const isHeading =
+      /^#{1,3}\s+.+$/.test(label) ||
+      /^第[0-9一二三四五六七八九十百零两〇]+[章节回卷].*$/.test(label);
+    if (!isHeading) return [];
+    return [
+      {
+        label: label.replace(/^#{1,3}\s+/, ''),
+        target: `reading-section-${index}`,
+      },
+    ];
+  });
+}
+
 function formatReadDate(timestamp: number): string {
   return new Intl.DateTimeFormat('zh-CN', {
     month: 'short',
@@ -109,12 +159,30 @@ export default function OptionsPage() {
   const [isReaderOpen, setReaderOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [fontSize, setFontSize] = useState(18);
-  const [theme, setTheme] = useState<Theme>('light');
+  const [theme, setTheme] = useState<ReaderTheme>('light');
+  const [layout, setLayout] = useState<ReaderLayout>('scroll');
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('toc');
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [showProgress, setShowProgress] = useState(true);
+  const [allowPdfBackground, setAllowPdfBackground] = useState(false);
+  const [readerWidth, setReaderWidth] = useState(980);
+  const [zoom, setZoom] = useState(1);
+  const [isAutoZoom, setAutoZoom] = useState(true);
+  const [rotation, setRotation] = useState(0);
   const [readProgress, setReadProgress] = useState(0);
+  const [navigationItems, setNavigationItems] = useState<ReaderNavItem[]>([]);
+  const [navigationTarget, setNavigationTarget] = useState('');
+  const [selectedChapter, setSelectedChapter] = useState('');
+  const [jumpToPage, setJumpToPage] = useState(1);
+  const [pageCount, setPageCount] = useState(0);
+  const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy>();
+  const [navSearch, setNavSearch] = useState('');
   const [isLoading, setLoading] = useState(true);
   const [isImporting, setImporting] = useState(false);
   const [error, setError] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
+  const mobiEpubInput = useRef<HTMLInputElement>(null);
   const readerScroll = useRef<HTMLDivElement>(null);
   const saveTimer = useRef<number>();
 
@@ -133,12 +201,34 @@ export default function OptionsPage() {
     if (!activeBook || !isReaderOpen) return;
     setReadProgress(activeBook.progress);
     const frame = window.requestAnimationFrame(() => {
-      if (readerScroll.current) {
+      if (readerScroll.current && activeBook.scrollTop !== undefined) {
         readerScroll.current.scrollTop = activeBook.scrollTop;
       }
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeBook?.id, isReaderOpen]);
+
+  useEffect(() => {
+    if (!isReaderOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isReaderOpen]);
+
+  useEffect(() => {
+    setNavigationItems([]);
+    setNavigationTarget('');
+    setSelectedChapter('');
+    setJumpToPage(activeBook?.page ?? 1);
+    setPageCount(0);
+    setNavSearch('');
+    setSidebarTab('toc');
+    setZoom(1);
+    setAutoZoom(true);
+    setRotation(0);
+  }, [activeBook?.id]);
 
   useEffect(
     () => () => {
@@ -155,6 +245,69 @@ export default function OptionsPage() {
     );
   }, [books, query]);
 
+  const visibleNavigationItems = useMemo(() => {
+    const search = navSearch.trim().toLocaleLowerCase();
+    const activeNavigationItems =
+      activeBook?.format === 'txt' ||
+      activeBook?.format === 'md' ||
+      activeBook?.format === 'html'
+        ? getTextNavigation(activeBook.content ?? '')
+        : navigationItems;
+    return search
+      ? activeNavigationItems.filter((item) =>
+          item.label.toLocaleLowerCase().includes(search),
+        )
+      : activeNavigationItems;
+  }, [activeBook?.content, activeBook?.format, navigationItems, navSearch]);
+
+  const handleReaderToc = useCallback((items: ReaderNavItem[]) => {
+    setNavigationItems(items);
+  }, []);
+
+  const handleChapterChange = useCallback((target: string) => {
+    setSelectedChapter(target);
+  }, []);
+
+  const handlePdfPageCount = useCallback((count: number) => {
+    setPageCount(count);
+  }, []);
+
+  const handlePdfDocument = useCallback((document?: PDFDocumentProxy) => {
+    setPdfDocument(document);
+  }, []);
+
+  const navigateFromSidebar = (item: ReaderNavItem) => {
+    if (activeBook?.format === 'epub') {
+      setNavigationTarget(item.target);
+      setSelectedChapter(item.target);
+    } else if (activeBook?.format === 'pdf') {
+      const targetPage = Number(item.target);
+      if (Number.isInteger(targetPage)) {
+        setJumpToPage(targetPage);
+        setSelectedChapter(item.target);
+      }
+    } else {
+      document
+        .getElementById(item.target)
+        ?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      setSelectedChapter(item.target);
+    }
+  };
+
+  const adjustZoom = (direction: -1 | 1) => {
+    if (activeBook?.format === 'pdf') {
+      setAutoZoom(false);
+      setZoom((current) =>
+        Math.min(
+          2,
+          Math.max(0.6, Math.round((current + direction * 0.1) * 10) / 10),
+        ),
+      );
+    } else {
+      setFontSize((current) => Math.min(36, Math.max(12, current + direction)));
+    }
+  };
+
   const importFiles = async (files: FileList | null) => {
     if (!files?.length) return;
     setError('');
@@ -164,12 +317,49 @@ export default function OptionsPage() {
       for (const file of Array.from(files)) {
         const format = getFormat(file.name);
         if (!format) {
-          throw new Error(`${file.name}：目前支持 TXT、Markdown 和 HTML 文件`);
+          throw new Error(
+            `${file.name}：目前支持 TXT、Markdown、HTML、EPUB、PDF 以及 MOBI 转换导入`,
+          );
         }
+
+        const now = Date.now();
+
+        if (format === 'mobi') {
+          imported.push({
+            id: crypto.randomUUID(),
+            title: file.name.replace(/\.mobi$/i, '') || file.name,
+            fileName: file.name,
+            format,
+            addedAt: now,
+            updatedAt: now,
+            progress: 0,
+          });
+          continue;
+        }
+
+        if (format === 'epub' || format === 'pdf') {
+          const binaryData = await file.arrayBuffer();
+          const normalizedTitle = file.name.replace(
+            /\.(txt|md|markdown|html|htm|epub|pdf)$/i,
+            '',
+          );
+          imported.push({
+            id: crypto.randomUUID(),
+            title: normalizedTitle || file.name,
+            fileName: file.name,
+            format,
+            binaryData,
+            addedAt: now,
+            updatedAt: now,
+            progress: 0,
+            page: format === 'pdf' ? 1 : undefined,
+          });
+          continue;
+        }
+
         const source = await file.text();
         const content = format === 'html' ? htmlToText(source) : source;
         if (!content.trim()) throw new Error(`${file.name}：文件内容为空`);
-        const now = Date.now();
         imported.push({
           id: crypto.randomUUID(),
           title: file.name.replace(/\.(txt|md|markdown|html|htm)$/i, ''),
@@ -180,6 +370,7 @@ export default function OptionsPage() {
           updatedAt: now,
           progress: 0,
           scrollTop: 0,
+          readerMode: 'text',
         });
       }
       for (const book of imported) {
@@ -200,6 +391,35 @@ export default function OptionsPage() {
     }
   };
 
+  const saveBookPosition = useCallback(
+    async (bookId: string, position: BookPosition) => {
+      try {
+        const updatedBook = await updateBookPosition(bookId, {
+          ...position,
+          updatedAt: Date.now(),
+        });
+        setBooks((current) =>
+          current
+            .map((item) =>
+              item.id === bookId
+                ? { ...item, ...position, updatedAt: updatedBook.updatedAt }
+                : item,
+            )
+            .sort((a, b) => b.updatedAt - a.updatedAt),
+        );
+        setActiveBook((current) =>
+          current?.id === bookId
+            ? { ...current, ...position, updatedAt: updatedBook.updatedAt }
+            : current,
+        );
+        setReadProgress(position.progress);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : '保存阅读进度失败');
+      }
+    },
+    [],
+  );
+
   const persistPosition = async (book: Book, element: HTMLDivElement) => {
     const scrollableHeight = element.scrollHeight - element.clientHeight;
     const progress =
@@ -209,26 +429,22 @@ export default function OptionsPage() {
             Math.round((element.scrollTop / scrollableHeight) * 100),
           )
         : 0;
-    const updatedBook = {
-      ...book,
+    await saveBookPosition(book.id, {
       progress,
       scrollTop: element.scrollTop,
       updatedAt: Date.now(),
-    };
-    try {
-      await updateBook(updatedBook);
-      setBooks((current) =>
-        current
-          .map((item) => (item.id === book.id ? updatedBook : item))
-          .sort((a, b) => b.updatedAt - a.updatedAt),
-      );
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '保存阅读进度失败');
-    }
+    });
   };
 
   const onReaderScroll = () => {
     if (!activeBook || !readerScroll.current) return;
+    if (
+      activeBook.format !== 'txt' &&
+      activeBook.format !== 'md' &&
+      activeBook.format !== 'html'
+    ) {
+      return;
+    }
     const element = readerScroll.current;
     const scrollableHeight = element.scrollHeight - element.clientHeight;
     const progress =
@@ -245,13 +461,141 @@ export default function OptionsPage() {
     }, 700);
   };
 
+  const importConvertedEpub = async (file: File | undefined) => {
+    if (!activeBook || activeBook.format !== 'mobi' || !file) return;
+    setError('');
+    try {
+      if (getFormat(file.name) !== 'epub') {
+        throw new Error('请选择已转换完成的 EPUB 文件');
+      }
+      const convertedBook: Book = {
+        ...activeBook,
+        title: file.name.replace(/\.epub$/i, '') || activeBook.title,
+        fileName: file.name,
+        format: 'epub',
+        binaryData: await file.arrayBuffer(),
+        progress: 0,
+        chapter: undefined,
+        page: undefined,
+        scrollTop: 0,
+        updatedAt: Date.now(),
+      };
+      await updateBook(convertedBook);
+      setBooks((current) =>
+        current.map((book) =>
+          book.id === convertedBook.id ? convertedBook : book,
+        ),
+      );
+      setActiveBook(convertedBook);
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : '导入转换后的 EPUB 失败',
+      );
+    } finally {
+      if (mobiEpubInput.current) mobiEpubInput.current.value = '';
+    }
+  };
+
+  const handleActivePosition = useCallback(
+    (position: BookPosition) => {
+      if (activeBook) void saveBookPosition(activeBook.id, position);
+    },
+    [activeBook?.id, saveBookPosition],
+  );
+
+  const renderReaderBody = () => {
+    if (!activeBook) return null;
+    if (activeBook.format === 'mobi') {
+      return (
+        <div className={styles.formatMessage}>
+          <strong>此版本暂不直接阅读 MOBI</strong>
+          <p>
+            请先使用 Calibre 等桌面工具将此书转换为
+            EPUB，再选择转换后的文件继续阅读。
+            转换过程在你的设备上完成，书籍不会上传。
+          </p>
+          <button
+            className={styles.primaryButton}
+            type="button"
+            onClick={() => mobiEpubInput.current?.click()}
+          >
+            选择转换后的 EPUB
+          </button>
+          <input
+            ref={mobiEpubInput}
+            className={styles.fileInput}
+            type="file"
+            accept=".epub,application/epub+zip"
+            onChange={(event) =>
+              void importConvertedEpub(event.target.files?.[0])
+            }
+          />
+        </div>
+      );
+    }
+    if (activeBook.format === 'epub') {
+      return (
+        <EpubReader
+          key={activeBook.id}
+          book={activeBook}
+          fontSize={fontSize}
+          theme={theme}
+          layout={layout}
+          contentWidth={readerWidth}
+          navigationTarget={navigationTarget}
+          onPosition={handleActivePosition}
+          onToc={handleReaderToc}
+          onCurrentChapter={handleChapterChange}
+          onError={setError}
+        />
+      );
+    }
+    if (activeBook.format === 'pdf') {
+      return (
+        <PdfReader
+          key={activeBook.id}
+          book={activeBook}
+          fontSize={fontSize}
+          theme={theme}
+          layout={layout}
+          zoom={zoom}
+          rotation={rotation}
+          jumpToPage={jumpToPage}
+          allowPdfBackground={allowPdfBackground}
+          onPosition={handleActivePosition}
+          onToc={handleReaderToc}
+          onPageCount={handlePdfPageCount}
+          onDocument={handlePdfDocument}
+          onError={setError}
+        />
+      );
+    }
+    return (
+      <article
+        className={styles.readerText}
+        style={{
+          fontSize: `${fontSize}px`,
+          maxWidth: `${readerWidth}px`,
+        }}
+      >
+        {renderBookContent(activeBook.content ?? '')}
+      </article>
+    );
+  };
+
   const closeReader = () => {
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    if (activeBook && readerScroll.current) {
+    if (
+      activeBook &&
+      readerScroll.current &&
+      ['txt', 'md', 'html'].includes(activeBook.format)
+    ) {
       void persistPosition(activeBook, readerScroll.current);
     }
     setReaderOpen(false);
     setActiveBook(undefined);
+    setPdfDocument(undefined);
+    setPageCount(0);
   };
 
   const deleteActiveBook = async () => {
@@ -264,6 +608,8 @@ export default function OptionsPage() {
       );
       setReaderOpen(false);
       setActiveBook(undefined);
+      setPdfDocument(undefined);
+      setPageCount(0);
       setError('');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '移除图书失败');
@@ -272,6 +618,8 @@ export default function OptionsPage() {
 
   const openBook = (book: Book) => {
     setError('');
+    setPdfDocument(undefined);
+    setPageCount(0);
     setActiveBook(book);
     setReaderOpen(true);
   };
@@ -295,7 +643,7 @@ export default function OptionsPage() {
             ref={fileInput}
             className={styles.fileInput}
             type="file"
-            accept=".txt,.md,.markdown,.html,.htm,text/plain,text/markdown,text/html"
+            accept=".txt,.md,.markdown,.html,.htm,.epub,.pdf,.mobi,text/plain,text/markdown,text/html,application/pdf,application/epub+zip"
             multiple
             onChange={(event) => void importFiles(event.target.files)}
           />
@@ -368,7 +716,7 @@ export default function OptionsPage() {
               <p>
                 {query
                   ? '试试其他书名，或清空搜索内容。'
-                  : '导入一本 TXT、Markdown 或 HTML 书籍，开始你的阅读。'}
+                  : '导入一本 TXT、Markdown、HTML、EPUB 或 PDF 书籍，开始你的阅读。'}
               </p>
               {!query && (
                 <button
@@ -428,11 +776,68 @@ export default function OptionsPage() {
             >
               ← 返回书架
             </button>
-            <strong className={styles.readerBookName}>
-              {activeBook.title}
-            </strong>
             <button
-              className={styles.iconButton}
+              className={styles.headerIconButton}
+              type="button"
+              aria-label={sidebarOpen ? '隐藏目录' : '显示目录'}
+              title={sidebarOpen ? '隐藏目录' : '显示目录'}
+              onClick={() => setSidebarOpen((open) => !open)}
+            >
+              <span className={styles.sidebarToggleIcon} aria-hidden="true">
+                ☰
+              </span>
+              {!sidebarOpen && <span>目录</span>}
+            </button>
+            <div className={styles.headerSpacer} />
+            <div className={styles.zoomControls} aria-label="缩放">
+              <button
+                type="button"
+                aria-label="缩小"
+                onClick={() => adjustZoom(-1)}
+              >
+                −
+              </button>
+              <span>
+                {activeBook.format === 'pdf'
+                  ? isAutoZoom
+                    ? '适合窗口'
+                    : `${Math.round(zoom * 100)}%`
+                  : `${fontSize}px`}
+              </span>
+              <button
+                type="button"
+                aria-label="放大"
+                onClick={() => adjustZoom(1)}
+              >
+                +
+              </button>
+              {activeBook.format === 'pdf' && (
+                <button
+                  className={styles.fitButton}
+                  type="button"
+                  title="适合窗口"
+                  onClick={() => {
+                    setZoom(1);
+                    setAutoZoom(true);
+                  }}
+                >
+                  自动缩放
+                </button>
+              )}
+            </div>
+            <button
+              className={`${styles.headerIconButton} ${
+                settingsOpen ? styles.headerIconActive : ''
+              }`}
+              type="button"
+              aria-label="阅读设置"
+              title="阅读设置"
+              onClick={() => setSettingsOpen((open) => !open)}
+            >
+              ⚙
+            </button>
+            <button
+              className={styles.headerIconButton}
               type="button"
               aria-label="从书架移除"
               title="从书架移除"
@@ -441,57 +846,332 @@ export default function OptionsPage() {
               ×
             </button>
           </header>
-          <div className={styles.readerToolbar}>
-            <div className={styles.readerControls} aria-label="字号">
-              <button
-                type="button"
-                aria-label="缩小字号"
-                onClick={() => setFontSize((size) => Math.max(14, size - 1))}
-              >
-                A−
-              </button>
-              <span className={styles.fontSize}>{fontSize}px</span>
-              <button
-                type="button"
-                aria-label="放大字号"
-                onClick={() => setFontSize((size) => Math.min(28, size + 1))}
-              >
-                A+
-              </button>
-            </div>
-            <span className={styles.toolbarDivider} />
-            {(['light', 'sepia', 'dark'] as Theme[]).map((option) => (
-              <button
-                key={option}
-                className={`${styles.themeButton} ${
-                  styles[`theme${option[0].toUpperCase()}${option.slice(1)}`]
-                } ${theme === option ? styles.activeTheme : ''}`}
-                type="button"
-                aria-label={`${option} 阅读主题`}
-                title={`${option} 阅读主题`}
-                onClick={() => setTheme(option)}
-              />
-            ))}
-          </div>
-          <div
-            className={styles.readerScroll}
-            ref={readerScroll}
-            onScroll={onReaderScroll}
-          >
-            <article
-              className={styles.readerText}
-              style={{ fontSize: `${fontSize}px` }}
+          {error && (
+            <div
+              className={`${styles.error} ${styles.readerError}`}
+              role="alert"
             >
-              {renderBookContent(activeBook.content)}
-            </article>
+              {error}
+            </div>
+          )}
+          <div className={styles.readerWorkspace}>
+            {sidebarOpen && (
+              <aside className={styles.readerSidebar}>
+                <div className={styles.sidebarBookTitle}>
+                  <strong title={activeBook.title}>{activeBook.title}</strong>
+                  <button
+                    className={styles.iconButton}
+                    type="button"
+                    aria-label="隐藏导航栏"
+                    onClick={() => setSidebarOpen(false)}
+                  >
+                    ×
+                  </button>
+                </div>
+                <div className={styles.sidebarTabs}>
+                  <button
+                    className={
+                      sidebarTab === 'toc' ? styles.activeSidebarTab : ''
+                    }
+                    type="button"
+                    onClick={() => setSidebarTab('toc')}
+                  >
+                    目录
+                  </button>
+                  <button
+                    className={
+                      sidebarTab === 'thumbnails' ? styles.activeSidebarTab : ''
+                    }
+                    type="button"
+                    onClick={() => setSidebarTab('thumbnails')}
+                  >
+                    缩略图
+                  </button>
+                </div>
+                <input
+                  className={styles.navSearch}
+                  aria-label="筛选目录"
+                  placeholder={
+                    sidebarTab === 'thumbnails' ? '筛选页面…' : '筛选章节…'
+                  }
+                  value={navSearch}
+                  onChange={(event) => setNavSearch(event.target.value)}
+                />
+                <div className={styles.sidebarList}>
+                  {activeBook.format === 'pdf' &&
+                  sidebarTab === 'thumbnails' &&
+                  pageCount ? (
+                    <div className={styles.thumbnailGrid}>
+                      {Array.from({ length: pageCount }, (_, index) => {
+                        const page = index + 1;
+                        const matches =
+                          !navSearch || String(page).includes(navSearch);
+                        return matches ? (
+                          pdfDocument ? (
+                            <PdfPageThumbnail
+                              key={page}
+                              document={pdfDocument}
+                              pageNumber={page}
+                              background={
+                                allowPdfBackground
+                                  ? pdfPageBackground(theme)
+                                  : '#ffffff'
+                              }
+                              matchThemeBackground={allowPdfBackground}
+                              theme={theme}
+                              isActive={activeBook.page === page}
+                              onClick={() =>
+                                navigateFromSidebar({
+                                  label: `第 ${page} 页`,
+                                  target: String(page),
+                                })
+                              }
+                            />
+                          ) : (
+                            <div className={styles.thumbnail} key={page}>
+                              正在载入…
+                            </div>
+                          )
+                        ) : null;
+                      })}
+                    </div>
+                  ) : activeBook.format === 'pdf' &&
+                    sidebarTab === 'toc' &&
+                    !visibleNavigationItems.length ? (
+                    <p className={styles.sidebarEmpty}>
+                      PDF 没有可用的书签目录。
+                    </p>
+                  ) : visibleNavigationItems.length ? (
+                    visibleNavigationItems.map((item, index) => (
+                      <button
+                        key={`${item.target}-${index}`}
+                        className={`${styles.navItem} ${
+                          (
+                            activeBook.format === 'pdf'
+                              ? activeBook.page === Number(item.target)
+                              : selectedChapter === item.target ||
+                                selectedChapter.split('#')[0] ===
+                                  item.target.split('#')[0]
+                          )
+                            ? styles.activeNavItem
+                            : ''
+                        } ${
+                          sidebarTab === 'thumbnails' ? styles.navThumbnail : ''
+                        }`}
+                        type="button"
+                        onClick={() => navigateFromSidebar(item)}
+                      >
+                        {sidebarTab === 'thumbnails' && (
+                          <span className={styles.navThumbnailPreview}>
+                            {item.label.slice(0, 2)}
+                          </span>
+                        )}
+                        <span>{item.label}</span>
+                      </button>
+                    ))
+                  ) : (
+                    <p className={styles.sidebarEmpty}>
+                      {activeBook.format === 'mobi'
+                        ? '请将 MOBI 转换为 EPUB 后阅读目录。'
+                        : activeBook.format === 'pdf'
+                        ? 'PDF 暂无可显示的页面。'
+                        : '这本书没有可用目录。'}
+                    </p>
+                  )}
+                </div>
+              </aside>
+            )}
+            <div
+              className={`${styles.readerScroll} ${
+                activeBook.format === 'epub'
+                  ? styles.readerScrollEpub
+                  : activeBook.format === 'pdf'
+                  ? styles.readerScrollPdf
+                  : ''
+              }`}
+              ref={readerScroll}
+              onScroll={onReaderScroll}
+            >
+              {renderReaderBody()}
+            </div>
+            {settingsOpen && (
+              <aside className={styles.settingsPanel}>
+                <header className={styles.settingsHeader}>
+                  <button
+                    className={styles.iconButton}
+                    type="button"
+                    aria-label="关闭设置"
+                    onClick={() => setSettingsOpen(false)}
+                  >
+                    ←
+                  </button>
+                  <strong>设置</strong>
+                  <button
+                    className={styles.iconButton}
+                    type="button"
+                    aria-label="关闭设置"
+                    onClick={() => setSettingsOpen(false)}
+                  >
+                    ×
+                  </button>
+                </header>
+                <div className={styles.settingsContent}>
+                  <label className={styles.settingRow}>
+                    <span>底部进度条</span>
+                    <input
+                      type="checkbox"
+                      checked={showProgress}
+                      onChange={(event) =>
+                        setShowProgress(event.target.checked)
+                      }
+                    />
+                  </label>
+                  <div className={styles.settingsSection}>排版</div>
+                  {(activeBook.format === 'epub' ||
+                    activeBook.format === 'pdf') && (
+                    <div className={styles.settingRow}>
+                      <span>阅读模式</span>
+                      <div className={styles.segmentedControl}>
+                        <button
+                          className={
+                            layout === 'scroll' ? styles.segmentActive : ''
+                          }
+                          type="button"
+                          onClick={() => setLayout('scroll')}
+                        >
+                          滚动
+                        </button>
+                        <button
+                          className={
+                            layout === 'single' ? styles.segmentActive : ''
+                          }
+                          type="button"
+                          onClick={() => setLayout('single')}
+                        >
+                          单页
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {activeBook.format !== 'pdf' &&
+                    activeBook.format !== 'mobi' && (
+                      <label className={styles.settingRange}>
+                        <span>文字大小</span>
+                        <input
+                          type="range"
+                          min="12"
+                          max="36"
+                          value={fontSize}
+                          onChange={(event) =>
+                            setFontSize(Number(event.target.value))
+                          }
+                        />
+                        <small>{fontSize}px</small>
+                      </label>
+                    )}
+                  {activeBook.format !== 'pdf' &&
+                    activeBook.format !== 'mobi' && (
+                      <label className={styles.settingRange}>
+                        <span>正文宽度</span>
+                        <input
+                          type="range"
+                          min="560"
+                          max="1400"
+                          step="40"
+                          value={readerWidth}
+                          onChange={(event) =>
+                            setReaderWidth(Number(event.target.value))
+                          }
+                        />
+                        <small>{readerWidth}px</small>
+                      </label>
+                    )}
+                  {activeBook.format === 'pdf' && (
+                    <div className={styles.settingRow}>
+                      <span>旋转页面</span>
+                      <div className={styles.segmentedControl}>
+                        <button
+                          type="button"
+                          onClick={() => setRotation((value) => value - 90)}
+                        >
+                          ↶ 逆时针
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setRotation((value) => value + 90)}
+                        >
+                          ↻ 顺时针
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  <div className={styles.settingsSection}>页面样式</div>
+                  {activeBook.format === 'pdf' && (
+                    <label className={styles.settingRow}>
+                      <span>
+                        PDF 书籍背景与主题一致
+                        <small className={styles.settingHint}>
+                          勾选后页面和缩略图背景会随主题切换
+                        </small>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={allowPdfBackground}
+                        onChange={(event) =>
+                          setAllowPdfBackground(event.target.checked)
+                        }
+                      />
+                    </label>
+                  )}
+                  <div className={styles.settingRow}>
+                    <span>主题</span>
+                    <div className={styles.themeSwatches}>
+                      {(
+                        [
+                          ['light', '#f4f4ef'],
+                          ['blue', '#a8d1d8'],
+                          ['sepia', '#d8bd78'],
+                          ['green', '#8dc78c'],
+                          ['rose', '#c99595'],
+                          ['dark', '#171a17'],
+                        ] as [ReaderTheme, string][]
+                      ).map(([option, color]) => (
+                        <button
+                          key={option}
+                          className={`${styles.themeSwatch} ${
+                            theme === option ? styles.activeSwatch : ''
+                          }`}
+                          style={{ backgroundColor: color }}
+                          type="button"
+                          aria-label={`${option} 阅读主题`}
+                          title={`${option} 阅读主题`}
+                          onClick={() => setTheme(option)}
+                        >
+                          {theme === option ? '✓' : ''}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </aside>
+            )}
           </div>
-          <footer className={styles.progressLine}>
-            <span>{readProgress}%</span>
-            <span className={styles.progressTrack}>
-              <span style={{ width: `${readProgress}%` }} />
-            </span>
-            <span>阅读进度</span>
-          </footer>
+          {showProgress && (
+            <footer className={styles.progressLine}>
+              <span>
+                {activeBook.format === 'pdf' && activeBook.page
+                  ? `第 ${activeBook.page} 页 · `
+                  : ''}
+                {readProgress}%
+              </span>
+              <span className={styles.progressTrack}>
+                <span style={{ width: `${readProgress}%` }} />
+              </span>
+              <span>
+                {activeBook.format === 'pdf' ? 'PDF 阅读进度' : '阅读进度'}
+              </span>
+            </footer>
+          )}
         </section>
       )}
     </div>

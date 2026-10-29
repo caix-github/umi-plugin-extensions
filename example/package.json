@@ -1,7 +1,9 @@
 {
   "version": "1.0.0",
   "dependencies": {
+    "epubjs": "^0.3.93",
     "jquery": "^3.6.0",
+    "pdfjs-dist": "^4.10.38",
     "require.js": "^1.0.0"
   },
   "devDependencies": {

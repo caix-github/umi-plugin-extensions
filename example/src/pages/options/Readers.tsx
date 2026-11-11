@@ -7,9 +7,10 @@ import type {
 } from 'epubjs';
 import ePub from 'epubjs';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
+import { getDocument, GlobalWorkerOptions, TextLayer } from 'pdfjs-dist';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Book, BookMark, BookPosition } from '../../utils/library';
+import { applyTextMarks } from '../../utils/textMarks';
 import styles from './index.css';
 
 export type ReaderTheme =
@@ -91,21 +92,24 @@ function applyEpubMarks(
   rendition: Rendition,
   marks: BookMark[],
 ): void {
-  rendition.getContents().forEach((contents) => {
+  const renditionContents: Contents | Contents[] = rendition.getContents();
+  const contentsList: Contents[] = Array.isArray(renditionContents)
+    ? renditionContents
+    : [renditionContents];
+  contentsList.forEach((contents) => {
     const highlightEnvironment = contents.window as Window &
       Partial<ReaderHighlightEnvironment>;
     const registry = highlightEnvironment.CSS?.highlights;
     const Highlight = highlightEnvironment.Highlight;
     if (!registry || !Highlight) return;
 
-    let styleElement = contents.document.getElementById(
+    const existingStyleElement = contents.document.getElementById(
       'paperbound-reader-marks',
     ) as HTMLStyleElement | null;
-    if (!styleElement) {
-      styleElement = contents.document.createElement('style');
-      styleElement.id = 'paperbound-reader-marks';
-      contents.document.head.appendChild(styleElement);
-    }
+    const styleElement =
+      existingStyleElement ?? contents.document.createElement('style');
+    styleElement.id = 'paperbound-reader-marks';
+    if (!existingStyleElement) contents.document.head.appendChild(styleElement);
 
     const rules: string[] = [];
     marks.forEach((mark) => {
@@ -315,6 +319,8 @@ export function EpubReader({
         color: `${colors.color} !important`,
         background: `${colors.background} !important`,
         'background-image': 'none !important',
+        '-webkit-user-select': 'text !important',
+        'user-select': 'text !important',
       },
       body: {
         'font-family':
@@ -325,6 +331,8 @@ export function EpubReader({
       },
       'body *': {
         color: `${colors.color} !important`,
+        '-webkit-user-select': 'text !important',
+        'user-select': 'text !important',
       },
       'p, li, blockquote': {
         'font-size': `${fontSize}px !important`,
@@ -430,6 +438,7 @@ async function getPdfNavigation(
 
 interface PdfPageProps {
   document: PDFDocumentProxy;
+  marks: BookMark[];
   pageNumber: number;
   root: HTMLDivElement;
   zoom: number;
@@ -557,6 +566,7 @@ export function PdfPageThumbnail({
 
 function PdfPage({
   document,
+  marks,
   pageNumber,
   root,
   zoom,
@@ -570,6 +580,9 @@ function PdfPage({
 }: PdfPageProps) {
   const pageRef = useRef<HTMLDivElement>(null);
   const renderTaskRef = useRef<RenderTask>();
+  const textLayerRef = useRef<TextLayer>();
+  const marksRef = useRef(marks);
+  marksRef.current = marks;
   const [aspectRatio, setAspectRatio] = useState(1.414);
 
   useEffect(() => {
@@ -587,7 +600,7 @@ function PdfPage({
 
         void document
           .getPage(pageNumber)
-          .then((page) => {
+          .then(async (page) => {
             if (!isMounted || !pageRef.current) return;
             const baseViewport = page.getViewport({ scale: 1, rotation });
             setAspectRatio(baseViewport.height / baseViewport.width);
@@ -610,14 +623,27 @@ function PdfPage({
                 ? styles.pdfCanvasDark
                 : styles.pdfCanvasThemed
               : '';
-            pageRef.current.replaceChildren(canvas);
+            const textLayerElement = window.document.createElement('div');
+            textLayerElement.className = styles.pdfTextLayer;
+            textLayerElement.dataset.pdfTextLayer = 'true';
+            pageRef.current.replaceChildren(canvas, textLayerElement);
             const renderTask = page.render({
               canvasContext: context,
               viewport,
               background: '#ffffff',
             });
             renderTaskRef.current = renderTask;
-            return renderTask.promise;
+            await renderTask.promise;
+            if (!isMounted) return;
+            const textLayer = new TextLayer({
+              textContentSource: await page.getTextContent(),
+              container: textLayerElement,
+              viewport,
+            });
+            textLayerRef.current = textLayer;
+            await textLayer.render();
+            if (isMounted)
+              applyTextMarks(textLayerElement, marksRef.current, pageNumber);
           })
           .catch((cause: unknown) => {
             if (
@@ -641,6 +667,8 @@ function PdfPage({
       isMounted = false;
       observer.disconnect();
       renderTaskRef.current?.cancel();
+      textLayerRef.current?.cancel();
+      textLayerRef.current = undefined;
     };
   }, [
     availableWidth,
@@ -655,6 +683,13 @@ function PdfPage({
     theme,
     zoom,
   ]);
+
+  useEffect(() => {
+    const textLayer = pageRef.current?.querySelector<HTMLElement>(
+      '[data-pdf-text-layer]',
+    );
+    if (textLayer) applyTextMarks(textLayer, marks, pageNumber);
+  }, [marks, pageNumber]);
 
   return (
     <div
@@ -818,6 +853,7 @@ export function PdfReader({
                 <PdfPage
                   key={pageNumber}
                   document={pdfDocument}
+                  marks={book.marks ?? []}
                   pageNumber={pageNumber}
                   root={surface}
                   zoom={zoom}

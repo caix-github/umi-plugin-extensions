@@ -15,7 +15,7 @@ export default function PopupPage() {
       <a className={styles.openButton} href="options.html" target="_blank">
         打开我的书架 <span aria-hidden="true">↗</span>
       </a>
-      <p className={styles.formats}>支持 TXT · Markdown · HTML</p>
+      {/* <p className={styles.formats}>支持 TXT · Markdown · HTML</p> */}
     </main>
   );
 }

@@ -9,6 +9,7 @@ export interface BookMark {
   style: BookMarkStyle;
   start?: number;
   end?: number;
+  page?: number;
   cfiRange?: string;
 }
 

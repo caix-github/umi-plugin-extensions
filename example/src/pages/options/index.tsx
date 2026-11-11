@@ -18,6 +18,7 @@ import {
   updateBook,
   updateBookPosition,
 } from '../../utils/library';
+import { applyTextMarks } from '../../utils/textMarks';
 import styles from './index.css';
 import {
   EpubReader,
@@ -111,10 +112,9 @@ interface PendingMark {
   text: string;
   start?: number;
   end?: number;
+  page?: number;
   cfiRange?: string;
 }
-
-type PositionedBookMark = BookMark & { start: number; end: number };
 
 const markColors = [
   '#f2d94e',
@@ -124,98 +124,6 @@ const markColors = [
   '#8e4a8f',
   '#ef8354',
 ];
-
-function applyTextMarks(root: HTMLElement, marks: BookMark[]): void {
-  root
-    .querySelectorAll<HTMLElement>('[data-reader-mark]')
-    .forEach((wrapper) => {
-      wrapper.replaceWith(...Array.from(wrapper.childNodes));
-    });
-  root.normalize();
-
-  const textNodes: Text[] = [];
-  const walker = root.ownerDocument.createTreeWalker(
-    root,
-    NodeFilter.SHOW_TEXT,
-  );
-  let node: Node | null;
-  while ((node = walker.nextNode())) {
-    if (node.textContent) textNodes.push(node as Text);
-  }
-
-  let documentOffset = 0;
-  textNodes.forEach((textNode) => {
-    const textLength = textNode.data.length;
-    const nodeStart = documentOffset;
-    const nodeEnd = nodeStart + textLength;
-    documentOffset = nodeEnd;
-    const overlappingMarks = marks.filter(
-      (mark): mark is PositionedBookMark =>
-        typeof mark.start === 'number' &&
-        typeof mark.end === 'number' &&
-        mark.start < nodeEnd &&
-        mark.end > nodeStart,
-    );
-    if (!overlappingMarks.length) return;
-
-    const boundaries = new Set<number>([0, textLength]);
-    overlappingMarks.forEach((mark) => {
-      boundaries.add(Math.max(0, mark.start - nodeStart));
-      boundaries.add(Math.min(textLength, mark.end - nodeStart));
-    });
-    const sortedBoundaries = Array.from(boundaries).sort((a, b) => a - b);
-    const segments: { node: Text; start: number; end: number }[] = [];
-    let remaining = textNode;
-    let previousBoundary = 0;
-    sortedBoundaries.slice(1, -1).forEach((boundary) => {
-      const next = remaining.splitText(boundary - previousBoundary);
-      segments.push({
-        node: remaining,
-        start: previousBoundary,
-        end: boundary,
-      });
-      remaining = next;
-      previousBoundary = boundary;
-    });
-    segments.push({
-      node: remaining,
-      start: previousBoundary,
-      end: textLength,
-    });
-
-    segments.forEach((segment) => {
-      const segmentStart = nodeStart + segment.start;
-      const segmentEnd = nodeStart + segment.end;
-      const segmentMarks = overlappingMarks.filter(
-        (mark) => mark.start < segmentEnd && mark.end > segmentStart,
-      );
-      if (!segmentMarks.length || !segment.node.parentNode) return;
-
-      const wrapper = root.ownerDocument.createElement('span');
-      wrapper.dataset.readerMark = 'true';
-      wrapper.title = segmentMarks.map((mark) => mark.text).join(' · ');
-      const highlight = segmentMarks
-        .filter((mark) => mark.style === 'highlight')
-        .pop();
-      const underline = segmentMarks
-        .filter((mark) => mark.style !== 'highlight')
-        .pop();
-      if (highlight) {
-        wrapper.style.backgroundColor = `color-mix(in srgb, ${highlight.color} 48%, transparent)`;
-        wrapper.style.borderRadius = '2px';
-      }
-      if (underline) {
-        wrapper.style.textDecorationLine = 'underline';
-        wrapper.style.textDecorationColor = underline.color;
-        wrapper.style.textDecorationThickness = '2px';
-        wrapper.style.textDecorationStyle =
-          underline.style === 'wavy' ? 'wavy' : 'solid';
-      }
-      segment.node.parentNode.replaceChild(wrapper, segment.node);
-      wrapper.appendChild(segment.node);
-    });
-  });
-}
 
 function getFormat(fileName: string): Book['format'] | undefined {
   const extension = fileName.split('.').pop()?.toLowerCase();
@@ -386,10 +294,7 @@ export default function OptionsPage() {
   useLayoutEffect(() => {
     const article = textReaderRef.current;
     if (!article) return;
-    applyTextMarks(
-      article,
-      activeBook?.format === 'epub' ? [] : activeBook?.marks ?? [],
-    );
+    applyTextMarks(article, activeBook?.marks ?? []);
   }, [activeBook?.id, activeBook?.content, activeBook?.marks]);
 
   useEffect(() => {
@@ -560,20 +465,27 @@ export default function OptionsPage() {
   const captureTextSelection = () => {
     const article = textReaderRef.current;
     const selection = window.getSelection();
-    if (
-      !article ||
-      !selection ||
-      selection.isCollapsed ||
-      !selection.rangeCount
-    ) {
+    if (!selection || selection.isCollapsed || !selection.rangeCount) {
       setPendingMark(undefined);
       return;
     }
     const range = selection.getRangeAt(0);
-    if (
-      !article.contains(range.startContainer) ||
-      !article.contains(range.endContainer)
-    ) {
+    const startElement =
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as Element)
+        : range.startContainer.parentElement;
+    const textLayer = startElement?.closest<HTMLElement>(
+      '[data-pdf-text-layer]',
+    );
+    const isTextSelection = Boolean(
+      article?.contains(range.startContainer) &&
+        article.contains(range.endContainer),
+    );
+    const isPdfSelection = Boolean(
+      textLayer?.contains(range.endContainer) &&
+        textLayer.contains(range.startContainer),
+    );
+    if (!isTextSelection && !isPdfSelection) {
       setPendingMark(undefined);
       return;
     }
@@ -586,11 +498,24 @@ export default function OptionsPage() {
 
     const leadingWhitespace =
       selectedText.length - selectedText.trimStart().length;
-    const prefix = article.ownerDocument.createRange();
-    prefix.selectNodeContents(article);
+    const selectionRoot = isTextSelection ? article : textLayer;
+    if (!selectionRoot) return;
+    const prefix = selectionRoot.ownerDocument.createRange();
+    prefix.selectNodeContents(selectionRoot);
     prefix.setEnd(range.startContainer, range.startOffset);
     const start = prefix.toString().length + leadingWhitespace;
-    setPendingMark({ text, start, end: start + text.length });
+    const page =
+      isPdfSelection && textLayer
+        ? Number(
+            textLayer.closest('[data-pdf-page]')?.getAttribute('data-pdf-page'),
+          )
+        : undefined;
+    setPendingMark({
+      text,
+      start,
+      end: start + text.length,
+      ...(page ? { page } : {}),
+    });
   };
 
   const savePendingMark = async () => {
@@ -602,6 +527,7 @@ export default function OptionsPage() {
       style: markStyle,
       ...(pendingMark.start !== undefined ? { start: pendingMark.start } : {}),
       ...(pendingMark.end !== undefined ? { end: pendingMark.end } : {}),
+      ...(pendingMark.page !== undefined ? { page: pendingMark.page } : {}),
       ...(pendingMark.cfiRange ? { cfiRange: pendingMark.cfiRange } : {}),
     };
     const updatedBook: Book = {
@@ -1400,95 +1326,93 @@ export default function OptionsPage() {
             >
               {renderReaderBody()}
             </div>
-            {pendingMark &&
-              activeBook.format !== 'pdf' &&
-              activeBook.format !== 'mobi' && (
-                <div
-                  className={styles.markToolbar}
-                  role="toolbar"
-                  aria-label="文字标记"
-                  onTouchStart={(event) => event.stopPropagation()}
-                >
-                  <div className={styles.markPalette}>
-                    {markColors.map((color) => (
-                      <button
-                        key={color}
-                        className={`${styles.markColor} ${
-                          markColor === color ? styles.activeMarkColor : ''
-                        }`}
-                        type="button"
-                        aria-label={`选择颜色 ${color}`}
-                        title={color}
-                        style={{ backgroundColor: color }}
-                        onClick={() => setMarkColor(color)}
-                      />
-                    ))}
-                    <label
-                      className={`${styles.customMarkColor} ${
-                        !markColors.includes(markColor)
-                          ? styles.activeCustomMarkColor
-                          : ''
+            {pendingMark && activeBook.format !== 'mobi' && (
+              <div
+                className={styles.markToolbar}
+                role="toolbar"
+                aria-label="文字标记"
+                onTouchStart={(event) => event.stopPropagation()}
+              >
+                <div className={styles.markPalette}>
+                  {markColors.map((color) => (
+                    <button
+                      key={color}
+                      className={`${styles.markColor} ${
+                        markColor === color ? styles.activeMarkColor : ''
                       }`}
-                      title="自定义颜色"
-                    >
-                      <span aria-hidden="true">+</span>
-                      <input
-                        type="color"
-                        aria-label="自定义标记颜色"
-                        value={markColor}
-                        onChange={(event) => setMarkColor(event.target.value)}
-                      />
-                    </label>
-                  </div>
-                  <div className={styles.markActions}>
-                    <button
-                      className={
-                        markStyle === 'highlight' ? styles.activeMarkStyle : ''
-                      }
                       type="button"
-                      aria-pressed={markStyle === 'highlight'}
-                      onClick={() => setMarkStyle('highlight')}
-                    >
-                      底色
-                    </button>
-                    <button
-                      className={
-                        markStyle === 'underline' ? styles.activeMarkStyle : ''
-                      }
-                      type="button"
-                      aria-pressed={markStyle === 'underline'}
-                      onClick={() => setMarkStyle('underline')}
-                    >
-                      直线
-                    </button>
-                    <button
-                      className={
-                        markStyle === 'wavy' ? styles.activeMarkStyle : ''
-                      }
-                      type="button"
-                      aria-pressed={markStyle === 'wavy'}
-                      onClick={() => setMarkStyle('wavy')}
-                    >
-                      波浪
-                    </button>
-                    <button
-                      className={styles.saveMarkButton}
-                      type="button"
-                      onClick={() => void savePendingMark()}
-                    >
-                      标记
-                    </button>
-                    <button
-                      className={styles.dismissMarkButton}
-                      type="button"
-                      aria-label="取消标记"
-                      onClick={() => setPendingMark(undefined)}
-                    >
-                      ×
-                    </button>
-                  </div>
+                      aria-label={`选择颜色 ${color}`}
+                      title={color}
+                      style={{ backgroundColor: color }}
+                      onClick={() => setMarkColor(color)}
+                    />
+                  ))}
+                  <label
+                    className={`${styles.customMarkColor} ${
+                      !markColors.includes(markColor)
+                        ? styles.activeCustomMarkColor
+                        : ''
+                    }`}
+                    title="自定义颜色"
+                  >
+                    <span aria-hidden="true">+</span>
+                    <input
+                      type="color"
+                      aria-label="自定义标记颜色"
+                      value={markColor}
+                      onChange={(event) => setMarkColor(event.target.value)}
+                    />
+                  </label>
                 </div>
-              )}
+                <div className={styles.markActions}>
+                  <button
+                    className={
+                      markStyle === 'highlight' ? styles.activeMarkStyle : ''
+                    }
+                    type="button"
+                    aria-pressed={markStyle === 'highlight'}
+                    onClick={() => setMarkStyle('highlight')}
+                  >
+                    底色
+                  </button>
+                  <button
+                    className={
+                      markStyle === 'underline' ? styles.activeMarkStyle : ''
+                    }
+                    type="button"
+                    aria-pressed={markStyle === 'underline'}
+                    onClick={() => setMarkStyle('underline')}
+                  >
+                    直线
+                  </button>
+                  <button
+                    className={
+                      markStyle === 'wavy' ? styles.activeMarkStyle : ''
+                    }
+                    type="button"
+                    aria-pressed={markStyle === 'wavy'}
+                    onClick={() => setMarkStyle('wavy')}
+                  >
+                    波浪
+                  </button>
+                  <button
+                    className={styles.saveMarkButton}
+                    type="button"
+                    onClick={() => void savePendingMark()}
+                  >
+                    标记
+                  </button>
+                  <button
+                    className={styles.dismissMarkButton}
+                    type="button"
+                    aria-label="取消标记"
+                    onClick={() => setPendingMark(undefined)}
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            )}
             {settingsOpen && (
               <aside className={styles.settingsPanel}>
                 <header className={styles.settingsHeader}>

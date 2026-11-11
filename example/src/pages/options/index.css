@@ -1106,6 +1106,8 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-color: var(--line) transparent;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .readerError {
@@ -1211,6 +1213,7 @@
 }
 
 .pdfPage {
+  position: relative;
   width: max-content;
   min-width: min(100%, 1200px);
   flex: none;
@@ -1227,6 +1230,29 @@
   max-width: none;
   height: auto;
   background: #fff;
+}
+
+.pdfTextLayer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  line-height: 1;
+  text-align: initial;
+  transform-origin: 0 0;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.pdfTextLayer span {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+}
+
+.pdfTextLayer ::selection {
+  background: #3390ff66;
 }
 
 .pdfCanvasThemed {
@@ -1278,6 +1304,12 @@
   overflow-wrap: anywhere;
   text-align: justify;
   letter-spacing: 0.02em;
+}
+
+.readerText,
+.readerText * {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .readerText h1,
